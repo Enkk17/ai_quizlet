@@ -28,6 +28,12 @@ Legenda:
 | Risultati base | Conteggio risposte, corrette, errate e percentuale di accuratezza. |
 | Analytics base | Domande svolte, corrette, accuratezza, domande ufficiali e argomenti. |
 | Ripasso base | Visualizzazione dei ripassi scaduti e aggiornamento dell’intervallo dopo il completamento. |
+| API documentali | Dettaglio, eliminazione, processamento, reindicizzazione e capitoli per documento. |
+| API domande | Dettaglio, modifica, eliminazione, verifica e generazione strutturata via Ollama. |
+| API esami | Lista, dettaglio e avvio sessioni oltre al flusso di risposta e conclusione. |
+| API analytics | Statistiche giornaliere, argomenti, capitoli, fonti e storico esami. |
+| API ripassi | Ripassi odierni, futuri e storico. |
+| Test automatico | Test API del flusso importazione Markdown → esame → risposta → analytics. |
 | Container applicativi | Dockerfile funzionanti per backend e frontend. |
 | Infrastruttura locale | PostgreSQL, Qdrant, backend e frontend definiti in Docker Compose. |
 | Persistenza Docker | Volumi configurati per dati applicativi, PostgreSQL e Qdrant. |
@@ -38,13 +44,13 @@ Legenda:
 | Area | Stato attuale | Mancanze principali |
 |---|---|---|
 | Milestone 1 — Infrastructure | Stack locale predisposto e avviato. | Mancano monitoraggio completo, Ollama verificato con Qwen3 reale e setup Windows documentato in dettaglio. |
-| Milestone 2 — Document Manager | Upload, hash, persistenza e lista documenti funzionanti. | Mancano PostgreSQL, SQLAlchemy, Alembic, stati/job persistenti, dettaglio, eliminazione e reindicizzazione. |
+| Milestone 2 — Document Manager | Upload, hash, persistenza, lista, dettaglio, eliminazione, processamento e reindicizzazione. | Mancano PostgreSQL, SQLAlchemy, Alembic e job persistenti. |
 | PDF processing | Estrazione testo con PyMuPDF e conteggio pagine. | Mancano controllo qualità, OCR, struttura, capitoli/argomenti automatici, chunking semantico e pipeline asincrona. |
 | Official questions importer | Parser per il formato Markdown previsto. | Mancano segnalazione persistente degli input incompleti, deduplicazione esplicita, revisioni e collegamenti avanzati alle fonti. |
-| Exam Engine | Creazione, risposta, correzione e risultati base. | Mancano snapshot, avvio separato, timer, navigazione, modalità di correzione, domande non risposte e risultati dettagliati. |
+| Exam Engine | Creazione, lista, dettaglio, avvio, risposta, correzione e risultati base. | Mancano snapshot, timer, navigazione, modalità di correzione, domande non risposte e risultati dettagliati. |
 | Learning Engine | Tentativi e ripasso con intervallo raddoppiato. | Mancano analisi errori, topic progress, SM-2 completo, lacune e raccomandazioni. |
 | Analytics | Panoramica globale e performance per argomento. | Mancano serie giornaliere, storico, streak, capitoli, fonti, grafici, affidabilità statistica e readiness score. |
-| Ollama | Endpoint di stato e configurazione del modello. | Mancano client centralizzato, chat/generazione, embeddings, timeout avanzati, JSON Schema e gestione degli errori AI. |
+| Ollama | Client di generazione JSON strutturata, endpoint stato/modelli/test e generazione domanda grounded sul testo documentale. | Mancano chat, embeddings, Qdrant, prompt versionati e verifica AI indipendente. |
 | Frontend | Dashboard e quiz in una singola pagina. | Mancano pagine dedicate a documenti, capitoli, domande, esami, analytics, ripassi, risultati e impostazioni. |
 | Sicurezza upload | Estensione verificata e limite implicito del server. | Mancano MIME validation completa, limite configurabile, autenticazione, rate limiting e audit log. |
 
@@ -80,15 +86,9 @@ Legenda:
 - Stati `AI_GENERATED` e `AI_VERIFIED`.
 - Prompt versionati e tracciabilità delle generazioni.
 
-### API mancanti o incomplete
+### API ancora mancanti o incomplete
 
-- `/ai/models` e `/ai/test`.
-- Dettaglio, eliminazione, processamento e reindicizzazione documenti.
-- Capitoli per documento, dettaglio capitolo, topic e domande per capitolo.
-- Generazione, dettaglio, modifica, eliminazione e verifica domande.
-- Lista, dettaglio e avvio esami.
-- Analytics giornaliere, capitoli, fonti e storico.
-- Ripassi futuri e storico ripassi.
+- Restano da completare gli endpoint di chunk, RAG, job, backup e configurazione.
 
 ### Learning, UX e operatività
 
@@ -114,12 +114,12 @@ Legenda:
 
 1. Migrare la persistenza da SQLite a PostgreSQL con SQLAlchemy e Alembic.
 2. Separare `main.py` nei moduli API, servizi, repository e schemi.
-3. Implementare pipeline PDF, chunking, embeddings e Qdrant.
-4. Implementare il client Ollama e la generazione di domande grounded.
-5. Completare Exam Engine, Learning Engine e analytics.
+3. Implementare chunking, embeddings e Qdrant con retrieval filtrabile.
+4. Completare OCR, analisi strutturale e processamento asincrono dei PDF.
+5. Completare Exam Engine, Learning Engine e analytics avanzate.
 6. Sviluppare le pagine frontend mancanti.
 7. Aggiungere job asincroni, sicurezza, backup e monitoraggio.
-8. Aggiungere test unitari, d’integrazione ed end-to-end.
+8. Aggiungere test unitari, d’integrazione, E2E e dataset AI.
 
 ## Valutazione sintetica
 
@@ -131,12 +131,11 @@ Stima orientativa per milestone:
 | Milestone | Completamento stimato |
 |---|---:|
 | 1 — Infrastructure & Bootstrap | 70% |
-| 2 — Database e Document Manager | 45% |
+| 2 — Database e Document Manager | 55% |
 | 3 — Document Intelligence | 15% |
 | 4 — Official Questions Importer | 55% |
-| 5 — Question Generation Engine | 5% |
-| 6 — Exam Engine | 40% |
-| 7 — Learning Engine | 20% |
-| 8 — Analytics e UX avanzata | 20% |
+| 5 — Question Generation Engine | 25% |
+| 6 — Exam Engine | 50% |
+| 7 — Learning Engine | 25% |
+| 8 — Analytics e UX avanzata | 30% |
 | 9 — Hardening e stabilità | 15% |
-
