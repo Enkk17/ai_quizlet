@@ -32,6 +32,10 @@ def test_import_exam_and_analytics():
             files={"file": ("questions.md", MARKDOWN.encode(), "text/markdown")},
         )
         assert response.status_code == 200
+        document_id = response.json()["id"]
+        job = client.post(f"/api/documents/{document_id}/process")
+        assert job.status_code == 200
+        assert client.get(f"/api/jobs/{job.json()['job_id']}").json()["status"] == "COMPLETED"
         assert client.get("/api/questions").json()[0]["source_type"] == "OFFICIAL"
 
         exam = client.post("/api/exams", json={"title": "Test", "question_count": 1})
