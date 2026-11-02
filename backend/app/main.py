@@ -4,7 +4,9 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -83,6 +85,40 @@ def init_db() -> None:
               job_type TEXT NOT NULL, status TEXT NOT NULL, progress INTEGER NOT NULL DEFAULT 0,
               error TEXT, created_at TEXT NOT NULL, completed_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS topic_progress (
+              topic TEXT PRIMARY KEY, total_attempts INTEGER NOT NULL DEFAULT 0,
+              correct_attempts INTEGER NOT NULL DEFAULT 0, incorrect_attempts INTEGER NOT NULL DEFAULT 0,
+              accuracy_percentage REAL NOT NULL DEFAULT 0, average_response_time REAL NOT NULL DEFAULT 0,
+              last_attempt_at TEXT, mastery_score REAL NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS daily_learning_stats (
+              day TEXT PRIMARY KEY, questions_answered INTEGER NOT NULL DEFAULT 0,
+              correct_answers INTEGER NOT NULL DEFAULT 0, incorrect_answers INTEGER NOT NULL DEFAULT 0,
+              study_seconds REAL NOT NULL DEFAULT 0, exams_completed INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS import_errors (
+              id TEXT PRIMARY KEY, document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+              line_number INTEGER, message TEXT NOT NULL, raw_content TEXT,
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS question_sources (
+              id TEXT PRIMARY KEY, question_id TEXT NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+              document_id TEXT REFERENCES documents(id) ON DELETE SET NULL,
+              chunk_id TEXT REFERENCES document_chunks(id) ON DELETE SET NULL,
+              page_number INTEGER, relevance_score REAL, created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS ai_generation_jobs (
+              id TEXT PRIMARY KEY, question_id TEXT REFERENCES questions(id) ON DELETE SET NULL,
+              prompt_version TEXT NOT NULL, model TEXT NOT NULL, status TEXT NOT NULL,
+              created_at TEXT NOT NULL, completed_at TEXT, error TEXT
+            );
+            CREATE TABLE IF NOT EXISTS audit_logs (
+              id TEXT PRIMARY KEY, action TEXT NOT NULL, entity_type TEXT NOT NULL,
+              entity_id TEXT, metadata_json TEXT, created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS app_settings (
+              key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
             """
         )
 
@@ -93,6 +129,14 @@ def now() -> str:
 
 def row_dict(row: sqlite3.Row) -> dict[str, Any]:
     return dict(row) if row else {}
+
+
+def audit(action: str, entity_type: str, entity_id: str | None, metadata: dict[str, Any] | None = None) -> None:
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO audit_logs VALUES (?, ?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), action, entity_type, entity_id, json.dumps(metadata or {}), now()),
+        )
 
 
 def set_job(job_id: str, status: str, progress: int, error: str | None = None) -> None:
@@ -127,7 +171,7 @@ async def process_job(job_id: str, document_id: str) -> None:
         text = ""
         pages = 0
         if document["document_type"] == "PDF":
-            text, pages = extract_pdf(Path(document["stored_path"]).read_bytes())
+            text, pages, _ = extract_pdf_with_ocr(Path(document["stored_path"]).read_bytes())
             if not text.strip():
                 raise ValueError("PDF senza testo estraibile: OCR richiesto")
         else:
@@ -175,6 +219,13 @@ class ExamCreate(BaseModel):
     question_count: int = Field(default=10, ge=1, le=100)
     source_type: str = "MIXED"
     topic: str | None = None
+
+
+class SettingsUpdate(BaseModel):
+    ai_temperature: float | None = Field(default=None, ge=0, le=2)
+    ai_timeout: int | None = Field(default=None, ge=1, le=600)
+    chunk_size: int | None = Field(default=None, ge=100, le=3000)
+    chunk_overlap: int | None = Field(default=None, ge=0, le=500)
 
 
 class AnswerCreate(BaseModel):
@@ -331,6 +382,49 @@ async def system_status() -> dict[str, Any]:
     }
 
 
+@app.get("/api/settings")
+def settings() -> dict[str, str]:
+    with db() as conn:
+        values = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM app_settings")}
+    values.setdefault("ollama_model", OLLAMA_MODEL)
+    values.setdefault("ollama_embedding_model", OLLAMA_EMBEDDING_MODEL)
+    values.setdefault("qdrant_collection", QDRANT_COLLECTION)
+    return values
+
+
+@app.patch("/api/settings")
+def update_settings(payload: SettingsUpdate) -> dict[str, str]:
+    values = {key: str(value) for key, value in payload.model_dump().items() if value is not None}
+    with db() as conn:
+        for key, value in values.items():
+            conn.execute(
+                "INSERT INTO app_settings(key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                (key, value, now()),
+            )
+    audit("settings.updated", "settings", None, values)
+    return settings()
+
+
+@app.get("/api/audit")
+def audit_logs(limit: int = Query(default=100, ge=1, le=1000)) -> list[dict[str, Any]]:
+    with db() as conn:
+        return [row_dict(row) for row in conn.execute(
+            "SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT ?", (limit,)
+        )]
+
+
+@app.post("/api/backups")
+def create_backup() -> dict[str, Any]:
+    backup_dir = STORAGE / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    target = backup_dir / f"exam-ai-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.db"
+    with db() as source, sqlite3.connect(target) as destination:
+        source.backup(destination)
+    audit("backup.created", "database", None, {"path": str(target)})
+    return {"path": str(target), "size": target.stat().st_size}
+
+
 @app.get("/api/ai/status")
 async def ai_status() -> dict[str, Any]:
     try:
@@ -358,11 +452,14 @@ async def ai_test() -> dict[str, Any]:
 
 
 @app.get("/api/documents")
-def documents() -> list[dict[str, Any]]:
+def documents(
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> list[dict[str, Any]]:
     with db() as conn:
         return [row_dict(r) for r in conn.execute(
             "SELECT id, filename, document_type, file_size, status, total_pages, created_at "
-            "FROM documents ORDER BY created_at DESC"
+            "FROM documents ORDER BY created_at DESC LIMIT ? OFFSET ?", (limit, offset)
         )]
 
 
@@ -390,6 +487,7 @@ def delete_document(document_id: str) -> dict[str, str]:
             raise HTTPException(404, "Documento non trovato")
         conn.execute("DELETE FROM documents WHERE id = ?", (document_id,))
     Path(document["stored_path"]).unlink(missing_ok=True)
+    audit("document.deleted", "document", document_id)
     return {"status": "deleted", "id": document_id}
 
 
@@ -425,14 +523,19 @@ async def reindex_document(document_id: str, background_tasks: BackgroundTasks) 
 
 
 @app.get("/api/jobs")
-def jobs(status: str | None = None) -> list[dict[str, Any]]:
+def jobs(
+    status: str | None = None,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> list[dict[str, Any]]:
     with db() as conn:
         if status:
             return [row_dict(row) for row in conn.execute(
-                "SELECT * FROM processing_jobs WHERE status = ? ORDER BY created_at DESC", (status,)
+                "SELECT * FROM processing_jobs WHERE status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (status, limit, offset),
             )]
         return [row_dict(row) for row in conn.execute(
-            "SELECT * FROM processing_jobs ORDER BY created_at DESC"
+            "SELECT * FROM processing_jobs ORDER BY created_at DESC LIMIT ? OFFSET ?", (limit, offset)
         )]
 
 
@@ -446,13 +549,18 @@ def job_detail(job_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/documents/{document_id}/chunks")
-def document_chunks(document_id: str) -> list[dict[str, Any]]:
+def document_chunks(
+    document_id: str,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> list[dict[str, Any]]:
     with db() as conn:
         if not conn.execute("SELECT id FROM documents WHERE id = ?", (document_id,)).fetchone():
             raise HTTPException(404, "Documento non trovato")
         return [row_dict(row) for row in conn.execute(
             "SELECT id, document_id, content, page_start, page_end, chunk_index, content_hash, created_at "
-            "FROM document_chunks WHERE document_id = ? ORDER BY chunk_index", (document_id,)
+            "FROM document_chunks WHERE document_id = ? ORDER BY chunk_index LIMIT ? OFFSET ?",
+            (document_id, limit, offset),
         )]
 
 
@@ -488,6 +596,30 @@ def extract_pdf(data: bytes) -> tuple[str, int]:
         return "", 0
 
 
+def extract_pdf_with_ocr(data: bytes) -> tuple[str, int, bool]:
+    text, pages = extract_pdf(data)
+    if text.strip():
+        return text, pages, False
+    executable = shutil.which("ocrmypdf")
+    if not executable:
+        return "", pages, False
+    source = STORAGE / f"ocr-{uuid.uuid4()}.pdf"
+    target = STORAGE / f"ocr-{uuid.uuid4()}-out.pdf"
+    try:
+        source.write_bytes(data)
+        subprocess.run(
+            [executable, "--skip-text", str(source), str(target)],
+            check=True, capture_output=True, timeout=300,
+        )
+        ocr_text, ocr_pages = extract_pdf(target.read_bytes())
+        return ocr_text, ocr_pages, True
+    except (OSError, subprocess.SubprocessError, RuntimeError, ValueError):
+        return "", pages, False
+    finally:
+        source.unlink(missing_ok=True)
+        target.unlink(missing_ok=True)
+
+
 @app.post("/api/documents/upload")
 async def upload_document(file: UploadFile = File(...)) -> dict[str, Any]:
     suffix = Path(file.filename or "").suffix.lower()
@@ -508,7 +640,10 @@ async def upload_document(file: UploadFile = File(...)) -> dict[str, Any]:
     document_id = str(uuid.uuid4())
     target = UPLOADS / f"{document_id}{suffix}"
     target.write_bytes(data)
-    text, pages = extract_pdf(data) if suffix == ".pdf" else (data.decode("utf-8", errors="replace"), 0)
+    if suffix == ".pdf":
+        text, pages, _ = extract_pdf_with_ocr(data)
+    else:
+        text, pages = data.decode("utf-8", errors="replace"), 0
     document_type = "PDF" if suffix == ".pdf" else "MARKDOWN"
     with db() as conn:
         conn.execute(
@@ -518,6 +653,7 @@ async def upload_document(file: UploadFile = File(...)) -> dict[str, Any]:
         )
     if document_type == "MARKDOWN":
         import_markdown_questions(document_id, text)
+    audit("document.uploaded", "document", document_id, {"type": document_type, "size": len(data)})
     return {"id": document_id, "filename": file.filename, "status": "ANALYZED", "total_pages": pages}
 
 
@@ -526,7 +662,7 @@ def import_markdown_questions(document_id: str, text: str) -> int:
     current: dict[str, Any] | None = None
     count = 0
     with db() as conn:
-        for line in text.splitlines():
+        for line_number, line in enumerate(text.splitlines(), start=1):
             heading = re.match(r"^##\s+(.+)", line.strip())
             question_heading = re.match(r"^###\s+Domanda\s*(\d+)?", line.strip(), re.I)
             if heading:
@@ -534,6 +670,12 @@ def import_markdown_questions(document_id: str, text: str) -> int:
             if question_heading:
                 if current:
                     count += save_question(conn, document_id, chapter, current)
+                    if not current["text"] or len(current["options"]) != 4 or current["correct"] not in current["options"]:
+                        conn.execute(
+                            "INSERT INTO import_errors VALUES (?, ?, ?, ?, ?, ?)",
+                            (str(uuid.uuid4()), document_id, line_number, "Domanda incompleta o risposta non valida",
+                             current["text"][:500], now()),
+                        )
                 current = {"text": "", "options": {}, "correct": None, "explanation": ""}
                 continue
             if current is None:
@@ -551,12 +693,24 @@ def import_markdown_questions(document_id: str, text: str) -> int:
                 current["text"] += (" " if current["text"] else "") + line.strip()
         if current:
             count += save_question(conn, document_id, chapter, current)
+            if not current["text"] or len(current["options"]) != 4 or current["correct"] not in current["options"]:
+                conn.execute(
+                    "INSERT INTO import_errors VALUES (?, ?, ?, ?, ?, ?)",
+                    (str(uuid.uuid4()), document_id, line_number, "Domanda incompleta o risposta non valida",
+                     current["text"][:500], now()),
+                )
     return count
 
 
 def save_question(conn: sqlite3.Connection, document_id: str, chapter: str, item: dict[str, Any]) -> int:
     options = item["options"]
     if not item["text"] or len(options) != 4 or item["correct"] not in options:
+        return 0
+    duplicate = conn.execute(
+        "SELECT id FROM questions WHERE document_id = ? AND question_text = ?",
+        (document_id, item["text"]),
+    ).fetchone()
+    if duplicate:
         return 0
     chapter_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{document_id}:{chapter}"))
     conn.execute(
@@ -572,14 +726,20 @@ def save_question(conn: sqlite3.Connection, document_id: str, chapter: str, item
 
 
 @app.get("/api/questions")
-def questions(source_type: str | None = None, topic: str | None = None) -> list[dict[str, Any]]:
+def questions(
+    source_type: str | None = None,
+    topic: str | None = None,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> list[dict[str, Any]]:
     query = "SELECT * FROM questions WHERE 1=1"
     args: list[str] = []
     if source_type and source_type != "MIXED":
         query += " AND source_type = ?"; args.append(source_type)
     if topic:
         query += " AND topic = ?"; args.append(topic)
-    query += " ORDER BY created_at DESC"
+    query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+    args.extend([str(limit), str(offset)])
     with db() as conn:
         return [question_public(r) for r in conn.execute(query, args)]
 
@@ -622,11 +782,18 @@ def verify_question(question_id: str) -> dict[str, Any]:
             raise HTTPException(404, "Domanda non trovata")
         if question["source_type"] == "AI_GENERATED":
             conn.execute("UPDATE questions SET source_type = 'AI_VERIFIED' WHERE id = ?", (question_id,))
+    audit("question.verified", "question", question_id)
     return question_detail(question_id)
 
 
 @app.post("/api/questions/generate")
 async def generate_question(payload: QuestionGenerate) -> dict[str, Any]:
+    generation_id = str(uuid.uuid4())
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO ai_generation_jobs VALUES (?, NULL, 'v1-grounded-mcq', ?, 'PROCESSING', ?, NULL, NULL)",
+            (generation_id, OLLAMA_MODEL, now()),
+        )
     with db() as conn:
         query = "SELECT id, extracted_text FROM documents WHERE extracted_text <> ''"
         args: list[str] = []
@@ -635,6 +802,11 @@ async def generate_question(payload: QuestionGenerate) -> dict[str, Any]:
             args.append(payload.source_document_id)
         source = conn.execute(query + " ORDER BY created_at DESC LIMIT 1", args).fetchone()
         if not source:
+            with db() as failed:
+                failed.execute(
+                    "UPDATE ai_generation_jobs SET status = 'FAILED', error = ?, completed_at = ? WHERE id = ?",
+                    ("Nessun testo documentale disponibile", now(), generation_id),
+                )
             raise HTTPException(400, "Nessun testo documentale disponibile per il grounding")
         context = source["extracted_text"][:12000]
     schema = {
@@ -659,6 +831,11 @@ async def generate_question(payload: QuestionGenerate) -> dict[str, Any]:
         schema,
     )
     if set(result.get("options", {})) != set("ABCD") or result.get("correct_answer") not in "ABCD":
+        with db() as failed:
+            failed.execute(
+                "UPDATE ai_generation_jobs SET status = 'FAILED', error = ?, completed_at = ? WHERE id = ?",
+                ("Output Ollama non valido", now(), generation_id),
+            )
         raise HTTPException(502, "Ollama ha prodotto una domanda non valida")
     with db() as conn:
         question_id = str(uuid.uuid4())
@@ -667,7 +844,34 @@ async def generate_question(payload: QuestionGenerate) -> dict[str, Any]:
             (question_id, source["id"], result["topic"], result["question"], result["explanation"],
              payload.difficulty, result["correct_answer"], json.dumps(result["options"]), now()),
         )
+        conn.execute(
+            "INSERT INTO question_sources VALUES (?, ?, ?, NULL, NULL, ?, ?)",
+            (str(uuid.uuid4()), question_id, source["id"], 1.0, now()),
+        )
+        conn.execute(
+            "UPDATE ai_generation_jobs SET question_id = ?, status = 'COMPLETED', completed_at = ? WHERE id = ?",
+            (question_id, now(), generation_id),
+        )
+    audit("question.generated", "question", question_id, {"job_id": generation_id, "model": OLLAMA_MODEL})
     return question_detail(question_id)
+
+
+@app.get("/api/ai/jobs")
+def ai_jobs() -> list[dict[str, Any]]:
+    with db() as conn:
+        return [row_dict(row) for row in conn.execute(
+            "SELECT * FROM ai_generation_jobs ORDER BY created_at DESC"
+        )]
+
+
+@app.get("/api/questions/{question_id}/sources")
+def question_sources(question_id: str) -> list[dict[str, Any]]:
+    with db() as conn:
+        if not conn.execute("SELECT id FROM questions WHERE id = ?", (question_id,)).fetchone():
+            raise HTTPException(404, "Domanda non trovata")
+        return [row_dict(row) for row in conn.execute(
+            "SELECT * FROM question_sources WHERE question_id = ?", (question_id,)
+        )]
 
 
 @app.get("/api/chapters")
@@ -761,7 +965,30 @@ def answer(exam_id: str, payload: AnswerCreate) -> dict[str, Any]:
             "THEN excluded.due_date ELSE reviews.due_date END",
             (str(uuid.uuid4()), topic, date.today().isoformat() if not correct else (date.today() + timedelta(days=1)).isoformat()),
         )
-        return {"attempt_id": attempt, "is_correct": correct}
+        conn.execute(
+            "INSERT INTO topic_progress (topic, total_attempts, correct_attempts, incorrect_attempts, "
+            "accuracy_percentage, average_response_time, last_attempt_at, mastery_score) "
+            "VALUES (?, 1, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(topic) DO UPDATE SET "
+            "total_attempts = total_attempts + 1, correct_attempts = correct_attempts + excluded.correct_attempts, "
+            "incorrect_attempts = incorrect_attempts + excluded.incorrect_attempts, "
+            "accuracy_percentage = ((correct_attempts + excluded.correct_attempts) * 100.0) / (total_attempts + 1), "
+            "average_response_time = ((average_response_time * total_attempts) + excluded.average_response_time) / (total_attempts + 1), "
+            "last_attempt_at = excluded.last_attempt_at, mastery_score = MIN(100, "
+            "((correct_attempts + excluded.correct_attempts) * 100.0) / (total_attempts + 1))",
+            (topic, int(correct), int(not correct), int(correct) * 100,
+             payload.response_time_seconds, now(), int(correct) * 100),
+        )
+        today = date.today().isoformat()
+        conn.execute(
+            "INSERT INTO daily_learning_stats (day, questions_answered, correct_answers, incorrect_answers, study_seconds) "
+            "VALUES (?, 1, ?, ?, ?) ON CONFLICT(day) DO UPDATE SET "
+            "questions_answered = questions_answered + 1, correct_answers = correct_answers + excluded.correct_answers, "
+            "incorrect_answers = incorrect_answers + excluded.incorrect_answers, study_seconds = study_seconds + excluded.study_seconds",
+            (today, int(correct), int(not correct), payload.response_time_seconds),
+        )
+    audit("exam.answer", "attempt", attempt, {"exam_id": exam_id, "correct": correct})
+    return {"attempt_id": attempt, "is_correct": correct}
 
 
 @app.post("/api/exams/{exam_id}/finish")
@@ -771,7 +998,14 @@ def finish_exam(exam_id: str) -> dict[str, Any]:
         if not exam:
             raise HTTPException(404, "Esame non trovato")
         conn.execute("UPDATE exams SET status = 'COMPLETED', completed_at = ? WHERE id = ?", (now(), exam_id))
-        return exam_results(conn, exam_id)
+        conn.execute(
+            "INSERT INTO daily_learning_stats (day, exams_completed) VALUES (?, 1) "
+            "ON CONFLICT(day) DO UPDATE SET exams_completed = exams_completed + 1",
+            (date.today().isoformat(),),
+        )
+        result = exam_results(conn, exam_id)
+    audit("exam.completed", "exam", exam_id)
+    return result
 
 
 def exam_results(conn: sqlite3.Connection, exam_id: str) -> dict[str, Any]:
@@ -791,12 +1025,15 @@ def results(exam_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/exams")
-def exams() -> list[dict[str, Any]]:
+def exams(
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> list[dict[str, Any]]:
     with db() as conn:
         return [row_dict(r) for r in conn.execute(
             "SELECT id, title, status, created_at, completed_at, "
             "(length(question_ids) - length(replace(question_ids, ',', '')) + 1) total_questions "
-            "FROM exams ORDER BY created_at DESC"
+            "FROM exams ORDER BY created_at DESC LIMIT ? OFFSET ?", (limit, offset)
         )]
 
 
@@ -902,6 +1139,44 @@ def analytics_history(limit: int = Query(default=50, ge=1, le=500)) -> list[dict
         )]
 
 
+@app.get("/api/analytics/daily-stats")
+def analytics_daily_stats(days: int = Query(default=90, ge=1, le=365)) -> list[dict[str, Any]]:
+    with db() as conn:
+        return [row_dict(row) for row in conn.execute(
+            "SELECT * FROM daily_learning_stats WHERE day >= date('now', ?) ORDER BY day",
+            (f"-{days} days",),
+        )]
+
+
+@app.get("/api/analytics/progress")
+def analytics_progress() -> list[dict[str, Any]]:
+    with db() as conn:
+        return [row_dict(row) for row in conn.execute(
+            "SELECT * FROM topic_progress ORDER BY accuracy_percentage ASC, total_attempts DESC"
+        )]
+
+
+@app.get("/api/analytics/errors")
+def analytics_errors() -> list[dict[str, Any]]:
+    with db() as conn:
+        return [row_dict(row) for row in conn.execute(
+            "SELECT q.topic, q.question_text, a.selected_option, q.correct_option, "
+            "COUNT(*) occurrences, MAX(a.answered_at) last_seen "
+            "FROM attempts a JOIN questions q ON q.id = a.question_id "
+            "WHERE a.is_correct = 0 GROUP BY q.id ORDER BY occurrences DESC, last_seen DESC"
+        )]
+
+
+@app.get("/api/documents/{document_id}/import-errors")
+def document_import_errors(document_id: str) -> list[dict[str, Any]]:
+    with db() as conn:
+        if not conn.execute("SELECT id FROM documents WHERE id = ?", (document_id,)).fetchone():
+            raise HTTPException(404, "Documento non trovato")
+        return [row_dict(row) for row in conn.execute(
+            "SELECT * FROM import_errors WHERE document_id = ? ORDER BY line_number", (document_id,)
+        )]
+
+
 @app.get("/api/reviews/today")
 def reviews_today() -> list[dict[str, Any]]:
     with db() as conn:
@@ -932,7 +1207,11 @@ def complete_review(review_id: str) -> dict[str, Any]:
         review = conn.execute("SELECT * FROM reviews WHERE id = ?", (review_id,)).fetchone()
         if not review:
             raise HTTPException(404, "Ripasso non trovato")
-        interval = min(review["interval_days"] * 2, 60)
+        progress = conn.execute(
+            "SELECT accuracy_percentage FROM topic_progress WHERE topic = ?", (review["topic"],)
+        ).fetchone()
+        accuracy = progress["accuracy_percentage"] if progress else 0
+        interval = min(max(1, review["interval_days"] * 2 if accuracy >= 70 else 1), 60)
         due = date.today() + timedelta(days=interval)
         conn.execute("UPDATE reviews SET interval_days = ?, repetition_count = repetition_count + 1, due_date = ?, last_reviewed_at = ?, status = 'SCHEDULED' WHERE id = ?",
                      (interval, due.isoformat(), now(), review_id))

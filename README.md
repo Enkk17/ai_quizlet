@@ -41,3 +41,10 @@ docker compose -f infrastructure/docker-compose.yml up --build
 ```
 
 Questo avvia PostgreSQL, Qdrant, backend e frontend con volumi persistenti.
+
+Le migrazioni PostgreSQL sono in `backend/migrations` e si applicano con:
+
+```bash
+cd backend
+alembic upgrade head
+```
