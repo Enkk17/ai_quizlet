@@ -59,3 +59,14 @@ def test_chunking_preserves_overlap():
     chunks = chunks_for_text(" ".join(f"w{i}" for i in range(25)), size=10, overlap=2)
     assert len(chunks) == 3
     assert chunks[0].split()[-2:] == chunks[1].split()[:2]
+
+
+def test_upload_validation_and_progress():
+    with TestClient(app) as client:
+        invalid = client.post(
+            "/api/documents/upload",
+            files={"file": ("fake.pdf", b"not a pdf", "application/pdf")},
+        )
+        assert invalid.status_code == 415
+        assert client.get("/api/analytics/progress").status_code == 200
+        assert client.get("/api/analytics/errors").status_code == 200

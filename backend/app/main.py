@@ -83,6 +83,22 @@ def init_db() -> None:
               job_type TEXT NOT NULL, status TEXT NOT NULL, progress INTEGER NOT NULL DEFAULT 0,
               error TEXT, created_at TEXT NOT NULL, completed_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS topic_progress (
+              topic TEXT PRIMARY KEY, total_attempts INTEGER NOT NULL DEFAULT 0,
+              correct_attempts INTEGER NOT NULL DEFAULT 0, incorrect_attempts INTEGER NOT NULL DEFAULT 0,
+              accuracy_percentage REAL NOT NULL DEFAULT 0, average_response_time REAL NOT NULL DEFAULT 0,
+              last_attempt_at TEXT, mastery_score REAL NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS daily_learning_stats (
+              day TEXT PRIMARY KEY, questions_answered INTEGER NOT NULL DEFAULT 0,
+              correct_answers INTEGER NOT NULL DEFAULT 0, incorrect_answers INTEGER NOT NULL DEFAULT 0,
+              study_seconds REAL NOT NULL DEFAULT 0, exams_completed INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS import_errors (
+              id TEXT PRIMARY KEY, document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+              line_number INTEGER, message TEXT NOT NULL, raw_content TEXT,
+              created_at TEXT NOT NULL
+            );
             """
         )
 
@@ -526,7 +542,7 @@ def import_markdown_questions(document_id: str, text: str) -> int:
     current: dict[str, Any] | None = None
     count = 0
     with db() as conn:
-        for line in text.splitlines():
+        for line_number, line in enumerate(text.splitlines(), start=1):
             heading = re.match(r"^##\s+(.+)", line.strip())
             question_heading = re.match(r"^###\s+Domanda\s*(\d+)?", line.strip(), re.I)
             if heading:
@@ -534,6 +550,12 @@ def import_markdown_questions(document_id: str, text: str) -> int:
             if question_heading:
                 if current:
                     count += save_question(conn, document_id, chapter, current)
+                    if not current["text"] or len(current["options"]) != 4 or current["correct"] not in current["options"]:
+                        conn.execute(
+                            "INSERT INTO import_errors VALUES (?, ?, ?, ?, ?, ?)",
+                            (str(uuid.uuid4()), document_id, line_number, "Domanda incompleta o risposta non valida",
+                             current["text"][:500], now()),
+                        )
                 current = {"text": "", "options": {}, "correct": None, "explanation": ""}
                 continue
             if current is None:
@@ -551,12 +573,24 @@ def import_markdown_questions(document_id: str, text: str) -> int:
                 current["text"] += (" " if current["text"] else "") + line.strip()
         if current:
             count += save_question(conn, document_id, chapter, current)
+            if not current["text"] or len(current["options"]) != 4 or current["correct"] not in current["options"]:
+                conn.execute(
+                    "INSERT INTO import_errors VALUES (?, ?, ?, ?, ?, ?)",
+                    (str(uuid.uuid4()), document_id, line_number, "Domanda incompleta o risposta non valida",
+                     current["text"][:500], now()),
+                )
     return count
 
 
 def save_question(conn: sqlite3.Connection, document_id: str, chapter: str, item: dict[str, Any]) -> int:
     options = item["options"]
     if not item["text"] or len(options) != 4 or item["correct"] not in options:
+        return 0
+    duplicate = conn.execute(
+        "SELECT id FROM questions WHERE document_id = ? AND question_text = ?",
+        (document_id, item["text"]),
+    ).fetchone()
+    if duplicate:
         return 0
     chapter_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{document_id}:{chapter}"))
     conn.execute(
@@ -761,6 +795,28 @@ def answer(exam_id: str, payload: AnswerCreate) -> dict[str, Any]:
             "THEN excluded.due_date ELSE reviews.due_date END",
             (str(uuid.uuid4()), topic, date.today().isoformat() if not correct else (date.today() + timedelta(days=1)).isoformat()),
         )
+        conn.execute(
+            "INSERT INTO topic_progress (topic, total_attempts, correct_attempts, incorrect_attempts, "
+            "accuracy_percentage, average_response_time, last_attempt_at, mastery_score) "
+            "VALUES (?, 1, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(topic) DO UPDATE SET "
+            "total_attempts = total_attempts + 1, correct_attempts = correct_attempts + excluded.correct_attempts, "
+            "incorrect_attempts = incorrect_attempts + excluded.incorrect_attempts, "
+            "accuracy_percentage = ((correct_attempts + excluded.correct_attempts) * 100.0) / (total_attempts + 1), "
+            "average_response_time = ((average_response_time * total_attempts) + excluded.average_response_time) / (total_attempts + 1), "
+            "last_attempt_at = excluded.last_attempt_at, mastery_score = MIN(100, "
+            "((correct_attempts + excluded.correct_attempts) * 100.0) / (total_attempts + 1))",
+            (topic, int(correct), int(not correct), int(correct) * 100,
+             payload.response_time_seconds, now(), int(correct) * 100),
+        )
+        today = date.today().isoformat()
+        conn.execute(
+            "INSERT INTO daily_learning_stats (day, questions_answered, correct_answers, incorrect_answers, study_seconds) "
+            "VALUES (?, 1, ?, ?, ?) ON CONFLICT(day) DO UPDATE SET "
+            "questions_answered = questions_answered + 1, correct_answers = correct_answers + excluded.correct_answers, "
+            "incorrect_answers = incorrect_answers + excluded.incorrect_answers, study_seconds = study_seconds + excluded.study_seconds",
+            (today, int(correct), int(not correct), payload.response_time_seconds),
+        )
         return {"attempt_id": attempt, "is_correct": correct}
 
 
@@ -771,6 +827,11 @@ def finish_exam(exam_id: str) -> dict[str, Any]:
         if not exam:
             raise HTTPException(404, "Esame non trovato")
         conn.execute("UPDATE exams SET status = 'COMPLETED', completed_at = ? WHERE id = ?", (now(), exam_id))
+        conn.execute(
+            "INSERT INTO daily_learning_stats (day, exams_completed) VALUES (?, 1) "
+            "ON CONFLICT(day) DO UPDATE SET exams_completed = exams_completed + 1",
+            (date.today().isoformat(),),
+        )
         return exam_results(conn, exam_id)
 
 
@@ -902,6 +963,44 @@ def analytics_history(limit: int = Query(default=50, ge=1, le=500)) -> list[dict
         )]
 
 
+@app.get("/api/analytics/daily-stats")
+def analytics_daily_stats(days: int = Query(default=90, ge=1, le=365)) -> list[dict[str, Any]]:
+    with db() as conn:
+        return [row_dict(row) for row in conn.execute(
+            "SELECT * FROM daily_learning_stats WHERE day >= date('now', ?) ORDER BY day",
+            (f"-{days} days",),
+        )]
+
+
+@app.get("/api/analytics/progress")
+def analytics_progress() -> list[dict[str, Any]]:
+    with db() as conn:
+        return [row_dict(row) for row in conn.execute(
+            "SELECT * FROM topic_progress ORDER BY accuracy_percentage ASC, total_attempts DESC"
+        )]
+
+
+@app.get("/api/analytics/errors")
+def analytics_errors() -> list[dict[str, Any]]:
+    with db() as conn:
+        return [row_dict(row) for row in conn.execute(
+            "SELECT q.topic, q.question_text, a.selected_option, q.correct_option, "
+            "COUNT(*) occurrences, MAX(a.answered_at) last_seen "
+            "FROM attempts a JOIN questions q ON q.id = a.question_id "
+            "WHERE a.is_correct = 0 GROUP BY q.id ORDER BY occurrences DESC, last_seen DESC"
+        )]
+
+
+@app.get("/api/documents/{document_id}/import-errors")
+def document_import_errors(document_id: str) -> list[dict[str, Any]]:
+    with db() as conn:
+        if not conn.execute("SELECT id FROM documents WHERE id = ?", (document_id,)).fetchone():
+            raise HTTPException(404, "Documento non trovato")
+        return [row_dict(row) for row in conn.execute(
+            "SELECT * FROM import_errors WHERE document_id = ? ORDER BY line_number", (document_id,)
+        )]
+
+
 @app.get("/api/reviews/today")
 def reviews_today() -> list[dict[str, Any]]:
     with db() as conn:
@@ -932,7 +1031,11 @@ def complete_review(review_id: str) -> dict[str, Any]:
         review = conn.execute("SELECT * FROM reviews WHERE id = ?", (review_id,)).fetchone()
         if not review:
             raise HTTPException(404, "Ripasso non trovato")
-        interval = min(review["interval_days"] * 2, 60)
+        progress = conn.execute(
+            "SELECT accuracy_percentage FROM topic_progress WHERE topic = ?", (review["topic"],)
+        ).fetchone()
+        accuracy = progress["accuracy_percentage"] if progress else 0
+        interval = min(max(1, review["interval_days"] * 2 if accuracy >= 70 else 1), 60)
         due = date.today() + timedelta(days=interval)
         conn.execute("UPDATE reviews SET interval_days = ?, repetition_count = repetition_count + 1, due_date = ?, last_reviewed_at = ?, status = 'SCHEDULED' WHERE id = ?",
                      (interval, due.isoformat(), now(), review_id))

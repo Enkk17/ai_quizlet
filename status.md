@@ -39,6 +39,9 @@ Legenda:
 | Upload validation | Limite dimensione configurabile e controllo del contenuto MIME di PDF/Markdown. |
 | Frontend sections | Sezioni navigabili per dashboard, documenti, domande, progressi e ripassi. |
 | System status | Stato aggregato di database, Qdrant, Ollama e job pendenti. |
+| Learning progress | Progressi per argomento, statistiche giornaliere e analisi degli errori. |
+| PostgreSQL migration | Dipendenze SQLAlchemy/Alembic, configurazione `DATABASE_URL` e migrazione iniziale disponibili. |
+| Import quality | Deduplicazione domande ufficiali e report persistente degli input Markdown invalidi. |
 | Container applicativi | Dockerfile funzionanti per backend e frontend. |
 | Infrastruttura locale | PostgreSQL, Qdrant, backend e frontend definiti in Docker Compose. |
 | Persistenza Docker | Volumi configurati per dati applicativi, PostgreSQL e Qdrant. |
@@ -49,11 +52,11 @@ Legenda:
 | Area | Stato attuale | Mancanze principali |
 |---|---|---|
 | Milestone 1 — Infrastructure | Stack locale, healthcheck, stato aggregato e configurazione servizi. | Mancano monitoraggio hardware, Ollama verificato con Qwen3 reale e setup Windows dettagliato. |
-| Milestone 2 — Document Manager | Upload validato, hash, persistenza, lista, dettaglio, eliminazione, processamento/reindicizzazione e job persistenti. | Mancano PostgreSQL, SQLAlchemy e Alembic. |
+| Milestone 2 — Document Manager | Upload validato, hash, persistenza, lista, dettaglio, eliminazione, processamento/reindicizzazione, job persistenti e migrazione PostgreSQL. | Il runtime usa ancora SQLite come fallback predefinito; va completato il passaggio applicativo a SQLAlchemy. |
 | PDF processing | Estrazione testo con PyMuPDF, chunking base, job asincroni e riferimenti ai chunk. | Mancano controllo qualità avanzato, OCR, struttura e capitoli/argomenti automatici. |
 | Official questions importer | Parser per il formato Markdown previsto. | Mancano segnalazione persistente degli input incompleti, deduplicazione esplicita, revisioni e collegamenti avanzati alle fonti. |
 | Exam Engine | Creazione, lista, dettaglio, avvio, risposta, correzione e risultati base. | Mancano snapshot, timer, navigazione, modalità di correzione, domande non risposte e risultati dettagliati. |
-| Learning Engine | Tentativi e ripasso con intervallo raddoppiato. | Mancano analisi errori, topic progress, SM-2 completo, lacune e raccomandazioni. |
+| Learning Engine | Tentativi, progressi per argomento, statistiche giornaliere, analisi errori e intervallo adattivo. | Mancano SM-2 completo, classificazione AI delle lacune e raccomandazioni. |
 | Analytics | Panoramica globale e performance per argomento. | Mancano serie giornaliere, storico, streak, capitoli, fonti, grafici, affidabilità statistica e readiness score. |
 | Ollama | Client di generazione JSON strutturata ed embeddings configurabili. | Mancano chat, prompt versionati e verifica AI indipendente. |
 | Qdrant/RAG | Collection, indicizzazione dei chunk e ricerca semantica sono implementate via API REST. | Mancano filtri avanzati, reranking e reindicizzazione differenziale. |
@@ -65,8 +68,8 @@ Legenda:
 ### Architettura e database
 
 - Separazione completa in API, service, repository e AI service layer.
-- PostgreSQL come fonte di verità applicativa.
-- SQLAlchemy e migrazioni Alembic.
+- PostgreSQL come fonte di verità applicativa nel runtime.
+- Modelli SQLAlchemy collegati alle route esistenti.
 - Modelli completi per `topics`, `document_chunks`, `question_options`,
   `question_sources`, `exam_questions`, `topic_progress`, `review_schedule`,
   `daily_learning_stats`, job, tag, configurazioni e audit log.
@@ -96,7 +99,7 @@ Legenda:
 
 ### Learning, UX e operatività
 
-- Analisi delle categorie di errore e degli errori ricorrenti.
+- Classificazione AI delle categorie di errore e raccomandazioni personalizzate.
 - Piano di ripasso completo basato su accuratezza, difficoltà e storico.
 - Dashboard completa con grafici e dati per capitolo/fonte.
 - Pagine separate per tutte le aree indicate nella specifica.
@@ -135,14 +138,14 @@ Stima orientativa per milestone:
 | Milestone | Completamento stimato |
 |---|---:|
 | 1 — Infrastructure & Bootstrap | 80% |
-| 2 — Database e Document Manager | 70% |
+| 2 — Database e Document Manager | 80% |
 | 3 — Document Intelligence | 40% |
 | 4 — Official Questions Importer | 55% |
 | 5 — Question Generation Engine | 25% |
 | 6 — Exam Engine | 50% |
-| 7 — Learning Engine | 25% |
+| 7 — Learning Engine | 45% |
 | 8 — Analytics e UX avanzata | 45% |
-| 9 — Hardening e stabilità | 25% |
+| 9 — Hardening e stabilità | 30% |
 
 ### Obiettivo 60%
 
