@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -21,6 +21,10 @@ UPLOADS = Path(os.getenv("UPLOAD_DIR", STORAGE / "uploads"))
 DB_PATH = Path(os.getenv("DATABASE_PATH", STORAGE / "exam_ai.db"))
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
+OLLAMA_EMBEDDING_MODEL = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
+QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "exam_documents")
+MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE_MB", "100")) * 1024 * 1024
 UPLOADS.mkdir(parents=True, exist_ok=True)
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -68,6 +72,17 @@ def init_db() -> None:
               interval_days INTEGER NOT NULL DEFAULT 1, repetition_count INTEGER NOT NULL DEFAULT 0,
               last_reviewed_at TEXT, status TEXT NOT NULL DEFAULT 'DUE'
             );
+            CREATE TABLE IF NOT EXISTS document_chunks (
+              id TEXT PRIMARY KEY, document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+              content TEXT NOT NULL, page_start INTEGER, page_end INTEGER,
+              chunk_index INTEGER NOT NULL, content_hash TEXT NOT NULL,
+              created_at TEXT NOT NULL, UNIQUE(document_id, chunk_index)
+            );
+            CREATE TABLE IF NOT EXISTS processing_jobs (
+              id TEXT PRIMARY KEY, document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+              job_type TEXT NOT NULL, status TEXT NOT NULL, progress INTEGER NOT NULL DEFAULT 0,
+              error TEXT, created_at TEXT NOT NULL, completed_at TEXT
+            );
             """
         )
 
@@ -78,6 +93,73 @@ def now() -> str:
 
 def row_dict(row: sqlite3.Row) -> dict[str, Any]:
     return dict(row) if row else {}
+
+
+def set_job(job_id: str, status: str, progress: int, error: str | None = None) -> None:
+    with db() as conn:
+        conn.execute(
+            "UPDATE processing_jobs SET status = ?, progress = ?, error = ?, "
+            "completed_at = CASE WHEN ? IN ('COMPLETED', 'FAILED') THEN ? ELSE completed_at END "
+            "WHERE id = ?",
+            (status, progress, error, status, now(), job_id),
+        )
+
+
+def document_mime_is_valid(filename: str, data: bytes) -> bool:
+    suffix = Path(filename).suffix.lower()
+    if suffix == ".pdf":
+        return data.startswith(b"%PDF-")
+    if suffix in {".md", ".markdown"}:
+        return b"\x00" not in data[:4096]
+    return False
+
+
+async def process_job(job_id: str, document_id: str) -> None:
+    try:
+        set_job(job_id, "PROCESSING", 10)
+        with db() as conn:
+            document = conn.execute(
+                "SELECT document_type, stored_path FROM documents WHERE id = ?", (document_id,)
+            ).fetchone()
+        if not document:
+            raise ValueError("documento non trovato")
+        set_job(job_id, "PROCESSING", 35)
+        text = ""
+        pages = 0
+        if document["document_type"] == "PDF":
+            text, pages = extract_pdf(Path(document["stored_path"]).read_bytes())
+            if not text.strip():
+                raise ValueError("PDF senza testo estraibile: OCR richiesto")
+        else:
+            text = Path(document["stored_path"]).read_text(encoding="utf-8", errors="replace")
+        with db() as conn:
+            conn.execute(
+                "UPDATE documents SET extracted_text = ?, total_pages = ?, status = 'ANALYZED' WHERE id = ?",
+                (text, pages, document_id),
+            )
+        set_job(job_id, "PROCESSING", 70)
+        set_job(job_id, "COMPLETED", 100)
+    except Exception as exc:
+        with db() as conn:
+            conn.execute("UPDATE documents SET status = 'FAILED' WHERE id = ?", (document_id,))
+        set_job(job_id, "FAILED", 100, str(exc))
+
+
+async def reindex_job(job_id: str, document_id: str) -> None:
+    try:
+        set_job(job_id, "PROCESSING", 10)
+        with db() as conn:
+            document = conn.execute(
+                "SELECT extracted_text FROM documents WHERE id = ?", (document_id,)
+            ).fetchone()
+        if not document or not document["extracted_text"]:
+            raise ValueError("il documento non contiene testo analizzato")
+        count = await index_document(document_id, document["extracted_text"])
+        with db() as conn:
+            conn.execute("UPDATE documents SET status = 'INDEXED' WHERE id = ?", (document_id,))
+        set_job(job_id, "COMPLETED", 100)
+    except Exception as exc:
+        set_job(job_id, "FAILED", 100, str(exc))
 
 
 def question_public(row: sqlite3.Row) -> dict[str, Any]:
@@ -130,6 +212,85 @@ async def ollama_generate(prompt: str, schema: dict[str, Any]) -> dict[str, Any]
         raise HTTPException(503, f"Ollama non disponibile: {exc}") from exc
 
 
+async def ollama_embed(text: str) -> list[float]:
+    try:
+        async with httpx.AsyncClient(timeout=180) as client:
+            response = await client.post(
+                f"{OLLAMA_URL}/api/embed",
+                json={"model": OLLAMA_EMBEDDING_MODEL, "input": text},
+            )
+            response.raise_for_status()
+            embeddings = response.json().get("embeddings", [])
+            if not embeddings or not embeddings[0]:
+                raise ValueError("embedding vuoto")
+            return embeddings[0]
+    except (httpx.HTTPError, ValueError, KeyError) as exc:
+        raise HTTPException(503, f"Embedding Ollama non disponibile: {exc}") from exc
+
+
+def chunks_for_text(text: str, size: int = 700, overlap: int = 100) -> list[str]:
+    words = text.split()
+    if not words:
+        return []
+    result: list[str] = []
+    step = max(1, size - overlap)
+    for start in range(0, len(words), step):
+        chunk = " ".join(words[start:start + size]).strip()
+        if chunk:
+            result.append(chunk)
+        if start + size >= len(words):
+            break
+    return result
+
+
+async def qdrant_request(
+    method: str, path: str, body: dict[str, Any] | None = None, ignore_status: set[int] | None = None
+) -> dict[str, Any]:
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.request(method, f"{QDRANT_URL}{path}", json=body)
+            if response.status_code in (ignore_status or set()):
+                return {}
+            response.raise_for_status()
+            return response.json() if response.content else {}
+    except httpx.HTTPError as exc:
+        raise HTTPException(503, f"Qdrant non disponibile: {exc}") from exc
+
+
+async def index_document(document_id: str, text: str) -> int:
+    chunks = chunks_for_text(text)
+    if not chunks:
+        return 0
+    first_vector = await ollama_embed(chunks[0])
+    await qdrant_request(
+        "PUT", f"/collections/{QDRANT_COLLECTION}",
+        {"vectors": {"size": len(first_vector), "distance": "Cosine"}},
+        ignore_status={409},
+    )
+    points = []
+    for index, content in enumerate(chunks):
+        vector = first_vector if index == 0 else await ollama_embed(content)
+        chunk_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{document_id}:{index}"))
+        points.append({
+            "id": chunk_id,
+            "vector": vector,
+            "payload": {"document_id": document_id, "chunk_id": chunk_id, "chunk_index": index},
+        })
+    with db() as conn:
+        conn.execute("DELETE FROM document_chunks WHERE document_id = ?", (document_id,))
+        for index, content in enumerate(chunks):
+            chunk_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{document_id}:{index}"))
+            conn.execute(
+                "INSERT INTO document_chunks VALUES (?, ?, ?, NULL, NULL, ?, ?, ?)",
+                (chunk_id, document_id, content, index, hashlib.sha256(content.encode()).hexdigest(), now()),
+            )
+    await qdrant_request(
+        "PUT", f"/collections/{QDRANT_COLLECTION}/points?wait=true",
+        {"points": points},
+    )
+    return len(chunks)
+
+
 app = FastAPI(title="Exam AI API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
@@ -147,6 +308,27 @@ def startup() -> None:
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "service": "exam-ai"}
+
+
+@app.get("/api/system/status")
+async def system_status() -> dict[str, Any]:
+    with db() as conn:
+        database = conn.execute("SELECT 1").fetchone() is not None
+        pending_jobs = conn.execute(
+            "SELECT COUNT(*) count FROM processing_jobs WHERE status IN ('PENDING', 'PROCESSING')"
+        ).fetchone()["count"]
+    qdrant = True
+    try:
+        await qdrant_request("GET", "/readyz")
+    except HTTPException:
+        qdrant = False
+    ai = await ai_status()
+    return {
+        "database": {"available": database, "engine": "sqlite"},
+        "qdrant": {"available": qdrant, "collection": QDRANT_COLLECTION},
+        "ollama": ai,
+        "pending_jobs": pending_jobs,
+    }
 
 
 @app.get("/api/ai/status")
@@ -212,29 +394,89 @@ def delete_document(document_id: str) -> dict[str, str]:
 
 
 @app.post("/api/documents/{document_id}/process")
-def process_document(document_id: str) -> dict[str, Any]:
+async def process_document(document_id: str, background_tasks: BackgroundTasks) -> dict[str, Any]:
     with db() as conn:
-        document = conn.execute(
-            "SELECT id, document_type, stored_path FROM documents WHERE id = ?", (document_id,)
-        ).fetchone()
+        document = conn.execute("SELECT id FROM documents WHERE id = ?", (document_id,)).fetchone()
         if not document:
             raise HTTPException(404, "Documento non trovato")
-        if document["document_type"] == "PDF":
-            text, pages = extract_pdf(Path(document["stored_path"]).read_bytes())
-            conn.execute(
-                "UPDATE documents SET extracted_text = ?, total_pages = ?, status = 'ANALYZED' WHERE id = ?",
-                (text, pages, document_id),
-            )
-        return {"id": document_id, "status": "ANALYZED"}
+        job_id = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO processing_jobs VALUES (?, ?, 'DOCUMENT_PROCESSING', 'PENDING', 0, NULL, ?, NULL)",
+            (job_id, document_id, now()),
+        )
+        conn.execute("UPDATE documents SET status = 'PROCESSING' WHERE id = ?", (document_id,))
+    background_tasks.add_task(process_job, job_id, document_id)
+    return {"id": document_id, "job_id": job_id, "status": "PROCESSING"}
 
 
 @app.post("/api/documents/{document_id}/reindex")
-def reindex_document(document_id: str) -> dict[str, Any]:
+async def reindex_document(document_id: str, background_tasks: BackgroundTasks) -> dict[str, Any]:
+    with db() as conn:
+        document = conn.execute("SELECT id FROM documents WHERE id = ?", (document_id,)).fetchone()
+        if not document:
+            raise HTTPException(404, "Documento non trovato")
+        job_id = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO processing_jobs VALUES (?, ?, 'REINDEX', 'PENDING', 0, NULL, ?, NULL)",
+            (job_id, document_id, now()),
+        )
+    background_tasks.add_task(reindex_job, job_id, document_id)
+    return {"id": document_id, "job_id": job_id, "status": "PROCESSING"}
+
+
+@app.get("/api/jobs")
+def jobs(status: str | None = None) -> list[dict[str, Any]]:
+    with db() as conn:
+        if status:
+            return [row_dict(row) for row in conn.execute(
+                "SELECT * FROM processing_jobs WHERE status = ? ORDER BY created_at DESC", (status,)
+            )]
+        return [row_dict(row) for row in conn.execute(
+            "SELECT * FROM processing_jobs ORDER BY created_at DESC"
+        )]
+
+
+@app.get("/api/jobs/{job_id}")
+def job_detail(job_id: str) -> dict[str, Any]:
+    with db() as conn:
+        job = conn.execute("SELECT * FROM processing_jobs WHERE id = ?", (job_id,)).fetchone()
+        if not job:
+            raise HTTPException(404, "Job non trovato")
+        return row_dict(job)
+
+
+@app.get("/api/documents/{document_id}/chunks")
+def document_chunks(document_id: str) -> list[dict[str, Any]]:
     with db() as conn:
         if not conn.execute("SELECT id FROM documents WHERE id = ?", (document_id,)).fetchone():
             raise HTTPException(404, "Documento non trovato")
-        conn.execute("UPDATE documents SET status = 'INDEXED' WHERE id = ?", (document_id,))
-        return {"id": document_id, "status": "INDEXED"}
+        return [row_dict(row) for row in conn.execute(
+            "SELECT id, document_id, content, page_start, page_end, chunk_index, content_hash, created_at "
+            "FROM document_chunks WHERE document_id = ? ORDER BY chunk_index", (document_id,)
+        )]
+
+
+@app.get("/api/search")
+async def semantic_search(query: str, limit: int = Query(default=5, ge=1, le=20)) -> list[dict[str, Any]]:
+    vector = await ollama_embed(query)
+    result = await qdrant_request(
+        "POST", f"/collections/{QDRANT_COLLECTION}/points/search",
+        {"vector": vector, "limit": limit, "with_payload": True},
+    )
+    hits = result.get("result", [])
+    ids = [hit.get("payload", {}).get("chunk_id") for hit in hits]
+    ids = [chunk_id for chunk_id in ids if chunk_id]
+    if not ids:
+        return []
+    with db() as conn:
+        placeholders = ",".join("?" for _ in ids)
+        rows = {
+            row["id"]: row_dict(row) for row in conn.execute(
+                f"SELECT id, document_id, content, page_start, page_end, chunk_index "
+                f"FROM document_chunks WHERE id IN ({placeholders})", ids
+            )
+        }
+    return [{**rows[chunk_id], "score": hit.get("score", 0)} for hit in hits if (chunk_id := hit.get("payload", {}).get("chunk_id")) in rows]
 
 
 def extract_pdf(data: bytes) -> tuple[str, int]:
@@ -254,6 +496,10 @@ async def upload_document(file: UploadFile = File(...)) -> dict[str, Any]:
     data = await file.read()
     if not data:
         raise HTTPException(400, "Il file è vuoto")
+    if len(data) > MAX_UPLOAD_SIZE:
+        raise HTTPException(413, f"Il file supera il limite di {MAX_UPLOAD_SIZE // (1024 * 1024)} MB")
+    if not document_mime_is_valid(file.filename or "", data):
+        raise HTTPException(415, "Il contenuto del file non corrisponde al formato dichiarato")
     digest = hashlib.sha256(data).hexdigest()
     with db() as conn:
         duplicate = conn.execute("SELECT id FROM documents WHERE file_hash = ?", (digest,)).fetchone()

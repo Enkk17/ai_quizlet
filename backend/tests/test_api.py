@@ -9,7 +9,7 @@ Path(os.environ["UPLOAD_DIR"]).mkdir(parents=True, exist_ok=True)
 
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app.main import app, chunks_for_text
 
 
 MARKDOWN = """# Anatomia
@@ -32,6 +32,10 @@ def test_import_exam_and_analytics():
             files={"file": ("questions.md", MARKDOWN.encode(), "text/markdown")},
         )
         assert response.status_code == 200
+        document_id = response.json()["id"]
+        job = client.post(f"/api/documents/{document_id}/process")
+        assert job.status_code == 200
+        assert client.get(f"/api/jobs/{job.json()['job_id']}").json()["status"] == "COMPLETED"
         assert client.get("/api/questions").json()[0]["source_type"] == "OFFICIAL"
 
         exam = client.post("/api/exams", json={"title": "Test", "question_count": 1})
@@ -49,3 +53,9 @@ def test_import_exam_and_analytics():
         assert result.json()["accuracy"] == 100.0
         assert client.get("/api/analytics/daily").status_code == 200
         assert client.get("/api/reviews/today").status_code == 200
+
+
+def test_chunking_preserves_overlap():
+    chunks = chunks_for_text(" ".join(f"w{i}" for i in range(25)), size=10, overlap=2)
+    assert len(chunks) == 3
+    assert chunks[0].split()[-2:] == chunks[1].split()[:2]

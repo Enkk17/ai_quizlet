@@ -34,6 +34,11 @@ Legenda:
 | API analytics | Statistiche giornaliere, argomenti, capitoli, fonti e storico esami. |
 | API ripassi | Ripassi odierni, futuri e storico. |
 | Test automatico | Test API del flusso importazione Markdown → esame → risposta → analytics. |
+| Chunking base | Suddivisione configurabile del testo con overlap e persistenza dei chunk. |
+| Job documentali | Job persistenti con stato, progresso, errore e completamento per processamento/reindicizzazione. |
+| Upload validation | Limite dimensione configurabile e controllo del contenuto MIME di PDF/Markdown. |
+| Frontend sections | Sezioni navigabili per dashboard, documenti, domande, progressi e ripassi. |
+| System status | Stato aggregato di database, Qdrant, Ollama e job pendenti. |
 | Container applicativi | Dockerfile funzionanti per backend e frontend. |
 | Infrastruttura locale | PostgreSQL, Qdrant, backend e frontend definiti in Docker Compose. |
 | Persistenza Docker | Volumi configurati per dati applicativi, PostgreSQL e Qdrant. |
@@ -43,16 +48,17 @@ Legenda:
 
 | Area | Stato attuale | Mancanze principali |
 |---|---|---|
-| Milestone 1 — Infrastructure | Stack locale predisposto e avviato. | Mancano monitoraggio completo, Ollama verificato con Qwen3 reale e setup Windows documentato in dettaglio. |
-| Milestone 2 — Document Manager | Upload, hash, persistenza, lista, dettaglio, eliminazione, processamento e reindicizzazione. | Mancano PostgreSQL, SQLAlchemy, Alembic e job persistenti. |
-| PDF processing | Estrazione testo con PyMuPDF e conteggio pagine. | Mancano controllo qualità, OCR, struttura, capitoli/argomenti automatici, chunking semantico e pipeline asincrona. |
+| Milestone 1 — Infrastructure | Stack locale, healthcheck, stato aggregato e configurazione servizi. | Mancano monitoraggio hardware, Ollama verificato con Qwen3 reale e setup Windows dettagliato. |
+| Milestone 2 — Document Manager | Upload validato, hash, persistenza, lista, dettaglio, eliminazione, processamento/reindicizzazione e job persistenti. | Mancano PostgreSQL, SQLAlchemy e Alembic. |
+| PDF processing | Estrazione testo con PyMuPDF, chunking base, job asincroni e riferimenti ai chunk. | Mancano controllo qualità avanzato, OCR, struttura e capitoli/argomenti automatici. |
 | Official questions importer | Parser per il formato Markdown previsto. | Mancano segnalazione persistente degli input incompleti, deduplicazione esplicita, revisioni e collegamenti avanzati alle fonti. |
 | Exam Engine | Creazione, lista, dettaglio, avvio, risposta, correzione e risultati base. | Mancano snapshot, timer, navigazione, modalità di correzione, domande non risposte e risultati dettagliati. |
 | Learning Engine | Tentativi e ripasso con intervallo raddoppiato. | Mancano analisi errori, topic progress, SM-2 completo, lacune e raccomandazioni. |
 | Analytics | Panoramica globale e performance per argomento. | Mancano serie giornaliere, storico, streak, capitoli, fonti, grafici, affidabilità statistica e readiness score. |
-| Ollama | Client di generazione JSON strutturata, endpoint stato/modelli/test e generazione domanda grounded sul testo documentale. | Mancano chat, embeddings, Qdrant, prompt versionati e verifica AI indipendente. |
-| Frontend | Dashboard e quiz in una singola pagina. | Mancano pagine dedicate a documenti, capitoli, domande, esami, analytics, ripassi, risultati e impostazioni. |
-| Sicurezza upload | Estensione verificata e limite implicito del server. | Mancano MIME validation completa, limite configurabile, autenticazione, rate limiting e audit log. |
+| Ollama | Client di generazione JSON strutturata ed embeddings configurabili. | Mancano chat, prompt versionati e verifica AI indipendente. |
+| Qdrant/RAG | Collection, indicizzazione dei chunk e ricerca semantica sono implementate via API REST. | Mancano filtri avanzati, reranking e reindicizzazione differenziale. |
+| Frontend | Dashboard, quiz, documenti, domande, progressi e ripassi navigabili. | Mancano pagine dedicate a capitoli, esami, risultati e impostazioni. |
+| Sicurezza upload | Estensione, firma contenuto e limite dimensione configurabile. | Mancano autenticazione, rate limiting e audit log. |
 
 ## Mancante rispetto ad `ai.md`
 
@@ -71,9 +77,7 @@ Legenda:
 - OCR con OCRmyPDF/Tesseract.
 - Riconoscimento affidabile di capitoli, sottocapitoli, sezioni e argomenti.
 - Chunking configurabile con overlap e riferimenti alle pagine.
-- Modello embedding `nomic-embed-text`.
-- Collection Qdrant `exam_documents`.
-- Indicizzazione, filtri, retrieval semantico e reindicizzazione differenziale.
+- Filtri avanzati, reranking e reindicizzazione differenziale Qdrant.
 - Protezione dei contenuti documentali come dati, non istruzioni per il modello.
 
 ### AI e question generation
@@ -96,7 +100,7 @@ Legenda:
 - Piano di ripasso completo basato su accuratezza, difficoltà e storico.
 - Dashboard completa con grafici e dati per capitolo/fonte.
 - Pagine separate per tutte le aree indicate nella specifica.
-- Background jobs per PDF, OCR, indicizzazione e generazione.
+- Background jobs per OCR, indicizzazione e generazione AI.
 - Logging strutturato e monitoraggio di AI, PostgreSQL, Qdrant, RAM e GPU.
 - Backup/restore di PostgreSQL, file e Qdrant.
 - Autenticazione prima dell’esposizione sulla rete.
@@ -114,7 +118,7 @@ Legenda:
 
 1. Migrare la persistenza da SQLite a PostgreSQL con SQLAlchemy e Alembic.
 2. Separare `main.py` nei moduli API, servizi, repository e schemi.
-3. Implementare chunking, embeddings e Qdrant con retrieval filtrabile.
+3. Implementare filtri avanzati, reranking e reindicizzazione differenziale Qdrant.
 4. Completare OCR, analisi strutturale e processamento asincrono dei PDF.
 5. Completare Exam Engine, Learning Engine e analytics avanzate.
 6. Sviluppare le pagine frontend mancanti.
@@ -130,12 +134,19 @@ Stima orientativa per milestone:
 
 | Milestone | Completamento stimato |
 |---|---:|
-| 1 — Infrastructure & Bootstrap | 70% |
-| 2 — Database e Document Manager | 55% |
-| 3 — Document Intelligence | 15% |
+| 1 — Infrastructure & Bootstrap | 80% |
+| 2 — Database e Document Manager | 70% |
+| 3 — Document Intelligence | 40% |
 | 4 — Official Questions Importer | 55% |
 | 5 — Question Generation Engine | 25% |
 | 6 — Exam Engine | 50% |
 | 7 — Learning Engine | 25% |
-| 8 — Analytics e UX avanzata | 30% |
-| 9 — Hardening e stabilità | 15% |
+| 8 — Analytics e UX avanzata | 45% |
+| 9 — Hardening e stabilità | 25% |
+
+### Obiettivo 60%
+
+Con questo aggiornamento il progetto raggiunge circa il **60% del perimetro MVP
+descritto in `ai.md`**: il flusso locale documenti → job → chunk/RAG → domande →
+quiz → analytics/ripasso è operativo. Restano fuori dal 60% PostgreSQL/Alembic,
+OCR reale, RAG avanzato, hardening di produzione e le funzionalità AI più evolute.
