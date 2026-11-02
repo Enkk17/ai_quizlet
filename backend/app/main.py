@@ -21,6 +21,9 @@ UPLOADS = Path(os.getenv("UPLOAD_DIR", STORAGE / "uploads"))
 DB_PATH = Path(os.getenv("DATABASE_PATH", STORAGE / "exam_ai.db"))
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
+OLLAMA_EMBEDDING_MODEL = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
+QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "exam_documents")
 UPLOADS.mkdir(parents=True, exist_ok=True)
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -67,6 +70,12 @@ def init_db() -> None:
               id TEXT PRIMARY KEY, topic TEXT NOT NULL UNIQUE, due_date TEXT NOT NULL,
               interval_days INTEGER NOT NULL DEFAULT 1, repetition_count INTEGER NOT NULL DEFAULT 0,
               last_reviewed_at TEXT, status TEXT NOT NULL DEFAULT 'DUE'
+            );
+            CREATE TABLE IF NOT EXISTS document_chunks (
+              id TEXT PRIMARY KEY, document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+              content TEXT NOT NULL, page_start INTEGER, page_end INTEGER,
+              chunk_index INTEGER NOT NULL, content_hash TEXT NOT NULL,
+              created_at TEXT NOT NULL, UNIQUE(document_id, chunk_index)
             );
             """
         )
@@ -128,6 +137,85 @@ async def ollama_generate(prompt: str, schema: dict[str, Any]) -> dict[str, Any]
             return result
     except (httpx.HTTPError, ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(503, f"Ollama non disponibile: {exc}") from exc
+
+
+async def ollama_embed(text: str) -> list[float]:
+    try:
+        async with httpx.AsyncClient(timeout=180) as client:
+            response = await client.post(
+                f"{OLLAMA_URL}/api/embed",
+                json={"model": OLLAMA_EMBEDDING_MODEL, "input": text},
+            )
+            response.raise_for_status()
+            embeddings = response.json().get("embeddings", [])
+            if not embeddings or not embeddings[0]:
+                raise ValueError("embedding vuoto")
+            return embeddings[0]
+    except (httpx.HTTPError, ValueError, KeyError) as exc:
+        raise HTTPException(503, f"Embedding Ollama non disponibile: {exc}") from exc
+
+
+def chunks_for_text(text: str, size: int = 700, overlap: int = 100) -> list[str]:
+    words = text.split()
+    if not words:
+        return []
+    result: list[str] = []
+    step = max(1, size - overlap)
+    for start in range(0, len(words), step):
+        chunk = " ".join(words[start:start + size]).strip()
+        if chunk:
+            result.append(chunk)
+        if start + size >= len(words):
+            break
+    return result
+
+
+async def qdrant_request(
+    method: str, path: str, body: dict[str, Any] | None = None, ignore_status: set[int] | None = None
+) -> dict[str, Any]:
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.request(method, f"{QDRANT_URL}{path}", json=body)
+            if response.status_code in (ignore_status or set()):
+                return {}
+            response.raise_for_status()
+            return response.json() if response.content else {}
+    except httpx.HTTPError as exc:
+        raise HTTPException(503, f"Qdrant non disponibile: {exc}") from exc
+
+
+async def index_document(document_id: str, text: str) -> int:
+    chunks = chunks_for_text(text)
+    if not chunks:
+        return 0
+    first_vector = await ollama_embed(chunks[0])
+    await qdrant_request(
+        "PUT", f"/collections/{QDRANT_COLLECTION}",
+        {"vectors": {"size": len(first_vector), "distance": "Cosine"}},
+        ignore_status={409},
+    )
+    points = []
+    for index, content in enumerate(chunks):
+        vector = first_vector if index == 0 else await ollama_embed(content)
+        chunk_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{document_id}:{index}"))
+        points.append({
+            "id": chunk_id,
+            "vector": vector,
+            "payload": {"document_id": document_id, "chunk_id": chunk_id, "chunk_index": index},
+        })
+    with db() as conn:
+        conn.execute("DELETE FROM document_chunks WHERE document_id = ?", (document_id,))
+        for index, content in enumerate(chunks):
+            chunk_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{document_id}:{index}"))
+            conn.execute(
+                "INSERT INTO document_chunks VALUES (?, ?, ?, NULL, NULL, ?, ?, ?)",
+                (chunk_id, document_id, content, index, hashlib.sha256(content.encode()).hexdigest(), now()),
+            )
+    await qdrant_request(
+        "PUT", f"/collections/{QDRANT_COLLECTION}/points?wait=true",
+        {"points": points},
+    )
+    return len(chunks)
 
 
 app = FastAPI(title="Exam AI API", version="1.0.0")
@@ -229,12 +317,50 @@ def process_document(document_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/documents/{document_id}/reindex")
-def reindex_document(document_id: str) -> dict[str, Any]:
+async def reindex_document(document_id: str) -> dict[str, Any]:
+    with db() as conn:
+        document = conn.execute(
+            "SELECT id, extracted_text FROM documents WHERE id = ?", (document_id,)
+        ).fetchone()
+        if not document:
+            raise HTTPException(404, "Documento non trovato")
+        indexed = await index_document(document_id, document["extracted_text"])
+        conn.execute("UPDATE documents SET status = 'INDEXED' WHERE id = ?", (document_id,))
+        return {"id": document_id, "status": "INDEXED", "chunks": indexed}
+
+
+@app.get("/api/documents/{document_id}/chunks")
+def document_chunks(document_id: str) -> list[dict[str, Any]]:
     with db() as conn:
         if not conn.execute("SELECT id FROM documents WHERE id = ?", (document_id,)).fetchone():
             raise HTTPException(404, "Documento non trovato")
-        conn.execute("UPDATE documents SET status = 'INDEXED' WHERE id = ?", (document_id,))
-        return {"id": document_id, "status": "INDEXED"}
+        return [row_dict(row) for row in conn.execute(
+            "SELECT id, document_id, content, page_start, page_end, chunk_index, content_hash, created_at "
+            "FROM document_chunks WHERE document_id = ? ORDER BY chunk_index", (document_id,)
+        )]
+
+
+@app.get("/api/search")
+async def semantic_search(query: str, limit: int = Query(default=5, ge=1, le=20)) -> list[dict[str, Any]]:
+    vector = await ollama_embed(query)
+    result = await qdrant_request(
+        "POST", f"/collections/{QDRANT_COLLECTION}/points/search",
+        {"vector": vector, "limit": limit, "with_payload": True},
+    )
+    hits = result.get("result", [])
+    ids = [hit.get("payload", {}).get("chunk_id") for hit in hits]
+    ids = [chunk_id for chunk_id in ids if chunk_id]
+    if not ids:
+        return []
+    with db() as conn:
+        placeholders = ",".join("?" for _ in ids)
+        rows = {
+            row["id"]: row_dict(row) for row in conn.execute(
+                f"SELECT id, document_id, content, page_start, page_end, chunk_index "
+                f"FROM document_chunks WHERE id IN ({placeholders})", ids
+            )
+        }
+    return [{**rows[chunk_id], "score": hit.get("score", 0)} for hit in hits if (chunk_id := hit.get("payload", {}).get("chunk_id")) in rows]
 
 
 def extract_pdf(data: bytes) -> tuple[str, int]:

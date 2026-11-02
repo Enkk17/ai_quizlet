@@ -9,7 +9,7 @@ Path(os.environ["UPLOAD_DIR"]).mkdir(parents=True, exist_ok=True)
 
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app.main import app, chunks_for_text
 
 
 MARKDOWN = """# Anatomia
@@ -49,3 +49,9 @@ def test_import_exam_and_analytics():
         assert result.json()["accuracy"] == 100.0
         assert client.get("/api/analytics/daily").status_code == 200
         assert client.get("/api/reviews/today").status_code == 200
+
+
+def test_chunking_preserves_overlap():
+    chunks = chunks_for_text(" ".join(f"w{i}" for i in range(25)), size=10, overlap=2)
+    assert len(chunks) == 3
+    assert chunks[0].split()[-2:] == chunks[1].split()[:2]
