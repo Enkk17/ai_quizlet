@@ -70,3 +70,24 @@ def test_upload_validation_and_progress():
         assert invalid.status_code == 415
         assert client.get("/api/analytics/progress").status_code == 200
         assert client.get("/api/analytics/errors").status_code == 200
+
+
+def test_generated_question_keeps_source(monkeypatch):
+    async def fake_generate(prompt, schema):
+        return {
+            "question": "Quale funzione svolge lo scheletro?",
+            "options": {"A": "Sostegno", "B": "Digestione", "C": "Vista", "D": "Udito"},
+            "correct_answer": "A",
+            "explanation": "Fornisce sostegno.",
+            "topic": "Sistema scheletrico",
+        }
+
+    import app.main as module
+    monkeypatch.setattr(module, "ollama_generate", fake_generate)
+    with TestClient(app) as client:
+        generated = client.post("/api/questions/generate", json={})
+        assert generated.status_code == 200
+        question_id = generated.json()["id"]
+        sources = client.get(f"/api/questions/{question_id}/sources")
+        assert sources.status_code == 200
+        assert sources.json()[0]["relevance_score"] == 1.0

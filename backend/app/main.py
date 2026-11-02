@@ -99,6 +99,21 @@ def init_db() -> None:
               line_number INTEGER, message TEXT NOT NULL, raw_content TEXT,
               created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS question_sources (
+              id TEXT PRIMARY KEY, question_id TEXT NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+              document_id TEXT REFERENCES documents(id) ON DELETE SET NULL,
+              chunk_id TEXT REFERENCES document_chunks(id) ON DELETE SET NULL,
+              page_number INTEGER, relevance_score REAL, created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS ai_generation_jobs (
+              id TEXT PRIMARY KEY, question_id TEXT REFERENCES questions(id) ON DELETE SET NULL,
+              prompt_version TEXT NOT NULL, model TEXT NOT NULL, status TEXT NOT NULL,
+              created_at TEXT NOT NULL, completed_at TEXT, error TEXT
+            );
+            CREATE TABLE IF NOT EXISTS audit_logs (
+              id TEXT PRIMARY KEY, action TEXT NOT NULL, entity_type TEXT NOT NULL,
+              entity_id TEXT, metadata_json TEXT, created_at TEXT NOT NULL
+            );
             """
         )
 
@@ -109,6 +124,14 @@ def now() -> str:
 
 def row_dict(row: sqlite3.Row) -> dict[str, Any]:
     return dict(row) if row else {}
+
+
+def audit(action: str, entity_type: str, entity_id: str | None, metadata: dict[str, Any] | None = None) -> None:
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO audit_logs VALUES (?, ?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), action, entity_type, entity_id, json.dumps(metadata or {}), now()),
+        )
 
 
 def set_job(job_id: str, status: str, progress: int, error: str | None = None) -> None:
@@ -406,6 +429,7 @@ def delete_document(document_id: str) -> dict[str, str]:
             raise HTTPException(404, "Documento non trovato")
         conn.execute("DELETE FROM documents WHERE id = ?", (document_id,))
     Path(document["stored_path"]).unlink(missing_ok=True)
+    audit("document.deleted", "document", document_id)
     return {"status": "deleted", "id": document_id}
 
 
@@ -534,6 +558,7 @@ async def upload_document(file: UploadFile = File(...)) -> dict[str, Any]:
         )
     if document_type == "MARKDOWN":
         import_markdown_questions(document_id, text)
+    audit("document.uploaded", "document", document_id, {"type": document_type, "size": len(data)})
     return {"id": document_id, "filename": file.filename, "status": "ANALYZED", "total_pages": pages}
 
 
@@ -656,11 +681,18 @@ def verify_question(question_id: str) -> dict[str, Any]:
             raise HTTPException(404, "Domanda non trovata")
         if question["source_type"] == "AI_GENERATED":
             conn.execute("UPDATE questions SET source_type = 'AI_VERIFIED' WHERE id = ?", (question_id,))
+    audit("question.verified", "question", question_id)
     return question_detail(question_id)
 
 
 @app.post("/api/questions/generate")
 async def generate_question(payload: QuestionGenerate) -> dict[str, Any]:
+    generation_id = str(uuid.uuid4())
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO ai_generation_jobs VALUES (?, NULL, 'v1-grounded-mcq', ?, 'PROCESSING', ?, NULL, NULL)",
+            (generation_id, OLLAMA_MODEL, now()),
+        )
     with db() as conn:
         query = "SELECT id, extracted_text FROM documents WHERE extracted_text <> ''"
         args: list[str] = []
@@ -669,6 +701,11 @@ async def generate_question(payload: QuestionGenerate) -> dict[str, Any]:
             args.append(payload.source_document_id)
         source = conn.execute(query + " ORDER BY created_at DESC LIMIT 1", args).fetchone()
         if not source:
+            with db() as failed:
+                failed.execute(
+                    "UPDATE ai_generation_jobs SET status = 'FAILED', error = ?, completed_at = ? WHERE id = ?",
+                    ("Nessun testo documentale disponibile", now(), generation_id),
+                )
             raise HTTPException(400, "Nessun testo documentale disponibile per il grounding")
         context = source["extracted_text"][:12000]
     schema = {
@@ -693,6 +730,11 @@ async def generate_question(payload: QuestionGenerate) -> dict[str, Any]:
         schema,
     )
     if set(result.get("options", {})) != set("ABCD") or result.get("correct_answer") not in "ABCD":
+        with db() as failed:
+            failed.execute(
+                "UPDATE ai_generation_jobs SET status = 'FAILED', error = ?, completed_at = ? WHERE id = ?",
+                ("Output Ollama non valido", now(), generation_id),
+            )
         raise HTTPException(502, "Ollama ha prodotto una domanda non valida")
     with db() as conn:
         question_id = str(uuid.uuid4())
@@ -701,7 +743,34 @@ async def generate_question(payload: QuestionGenerate) -> dict[str, Any]:
             (question_id, source["id"], result["topic"], result["question"], result["explanation"],
              payload.difficulty, result["correct_answer"], json.dumps(result["options"]), now()),
         )
+        conn.execute(
+            "INSERT INTO question_sources VALUES (?, ?, ?, NULL, NULL, ?, ?)",
+            (str(uuid.uuid4()), question_id, source["id"], 1.0, now()),
+        )
+        conn.execute(
+            "UPDATE ai_generation_jobs SET question_id = ?, status = 'COMPLETED', completed_at = ? WHERE id = ?",
+            (question_id, now(), generation_id),
+        )
+    audit("question.generated", "question", question_id, {"job_id": generation_id, "model": OLLAMA_MODEL})
     return question_detail(question_id)
+
+
+@app.get("/api/ai/jobs")
+def ai_jobs() -> list[dict[str, Any]]:
+    with db() as conn:
+        return [row_dict(row) for row in conn.execute(
+            "SELECT * FROM ai_generation_jobs ORDER BY created_at DESC"
+        )]
+
+
+@app.get("/api/questions/{question_id}/sources")
+def question_sources(question_id: str) -> list[dict[str, Any]]:
+    with db() as conn:
+        if not conn.execute("SELECT id FROM questions WHERE id = ?", (question_id,)).fetchone():
+            raise HTTPException(404, "Domanda non trovata")
+        return [row_dict(row) for row in conn.execute(
+            "SELECT * FROM question_sources WHERE question_id = ?", (question_id,)
+        )]
 
 
 @app.get("/api/chapters")
@@ -817,7 +886,8 @@ def answer(exam_id: str, payload: AnswerCreate) -> dict[str, Any]:
             "incorrect_answers = incorrect_answers + excluded.incorrect_answers, study_seconds = study_seconds + excluded.study_seconds",
             (today, int(correct), int(not correct), payload.response_time_seconds),
         )
-        return {"attempt_id": attempt, "is_correct": correct}
+    audit("exam.answer", "attempt", attempt, {"exam_id": exam_id, "correct": correct})
+    return {"attempt_id": attempt, "is_correct": correct}
 
 
 @app.post("/api/exams/{exam_id}/finish")
@@ -832,7 +902,9 @@ def finish_exam(exam_id: str) -> dict[str, Any]:
             "ON CONFLICT(day) DO UPDATE SET exams_completed = exams_completed + 1",
             (date.today().isoformat(),),
         )
-        return exam_results(conn, exam_id)
+        result = exam_results(conn, exam_id)
+    audit("exam.completed", "exam", exam_id)
+    return result
 
 
 def exam_results(conn: sqlite3.Connection, exam_id: str) -> dict[str, Any]:

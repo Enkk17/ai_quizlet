@@ -42,6 +42,7 @@ Legenda:
 | Learning progress | Progressi per argomento, statistiche giornaliere e analisi degli errori. |
 | PostgreSQL migration | Dipendenze SQLAlchemy/Alembic, configurazione `DATABASE_URL` e migrazione iniziale disponibili. |
 | Import quality | Deduplicazione domande ufficiali e report persistente degli input Markdown invalidi. |
+| AI provenance | Job di generazione, versione prompt, modello usato, audit log e riferimenti documentali per domande AI. |
 | Container applicativi | Dockerfile funzionanti per backend e frontend. |
 | Infrastruttura locale | PostgreSQL, Qdrant, backend e frontend definiti in Docker Compose. |
 | Persistenza Docker | Volumi configurati per dati applicativi, PostgreSQL e Qdrant. |
@@ -58,7 +59,7 @@ Legenda:
 | Exam Engine | Creazione, lista, dettaglio, avvio, risposta, correzione e risultati base. | Mancano snapshot, timer, navigazione, modalità di correzione, domande non risposte e risultati dettagliati. |
 | Learning Engine | Tentativi, progressi per argomento, statistiche giornaliere, analisi errori e intervallo adattivo. | Mancano SM-2 completo, classificazione AI delle lacune e raccomandazioni. |
 | Analytics | Panoramica globale e performance per argomento. | Mancano serie giornaliere, storico, streak, capitoli, fonti, grafici, affidabilità statistica e readiness score. |
-| Ollama | Client di generazione JSON strutturata ed embeddings configurabili. | Mancano chat, prompt versionati e verifica AI indipendente. |
+| Ollama | Client di generazione JSON strutturata, embeddings, job AI, prompt versionato e provenance. | Mancano chat e verifica AI indipendente. |
 | Qdrant/RAG | Collection, indicizzazione dei chunk e ricerca semantica sono implementate via API REST. | Mancano filtri avanzati, reranking e reindicizzazione differenziale. |
 | Frontend | Dashboard, quiz, documenti, domande, progressi e ripassi navigabili. | Mancano pagine dedicate a capitoli, esami, risultati e impostazioni. |
 | Sicurezza upload | Estensione, firma contenuto e limite dimensione configurabile. | Mancano autenticazione, rate limiting e audit log. |
@@ -100,6 +101,7 @@ Legenda:
 ### Learning, UX e operatività
 
 - Classificazione AI delle categorie di errore e raccomandazioni personalizzate.
+- Gestione completa delle revisioni delle domande ufficiali.
 - Piano di ripasso completo basato su accuratezza, difficoltà e storico.
 - Dashboard completa con grafici e dati per capitolo/fonte.
 - Pagine separate per tutte le aree indicate nella specifica.
@@ -141,7 +143,7 @@ Stima orientativa per milestone:
 | 2 — Database e Document Manager | 80% |
 | 3 — Document Intelligence | 40% |
 | 4 — Official Questions Importer | 55% |
-| 5 — Question Generation Engine | 25% |
+| 5 — Question Generation Engine | 40% |
 | 6 — Exam Engine | 50% |
 | 7 — Learning Engine | 45% |
 | 8 — Analytics e UX avanzata | 45% |
