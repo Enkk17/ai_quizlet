@@ -4,7 +4,9 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -114,6 +116,9 @@ def init_db() -> None:
               id TEXT PRIMARY KEY, action TEXT NOT NULL, entity_type TEXT NOT NULL,
               entity_id TEXT, metadata_json TEXT, created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS app_settings (
+              key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
             """
         )
 
@@ -166,7 +171,7 @@ async def process_job(job_id: str, document_id: str) -> None:
         text = ""
         pages = 0
         if document["document_type"] == "PDF":
-            text, pages = extract_pdf(Path(document["stored_path"]).read_bytes())
+            text, pages, _ = extract_pdf_with_ocr(Path(document["stored_path"]).read_bytes())
             if not text.strip():
                 raise ValueError("PDF senza testo estraibile: OCR richiesto")
         else:
@@ -214,6 +219,13 @@ class ExamCreate(BaseModel):
     question_count: int = Field(default=10, ge=1, le=100)
     source_type: str = "MIXED"
     topic: str | None = None
+
+
+class SettingsUpdate(BaseModel):
+    ai_temperature: float | None = Field(default=None, ge=0, le=2)
+    ai_timeout: int | None = Field(default=None, ge=1, le=600)
+    chunk_size: int | None = Field(default=None, ge=100, le=3000)
+    chunk_overlap: int | None = Field(default=None, ge=0, le=500)
 
 
 class AnswerCreate(BaseModel):
@@ -368,6 +380,49 @@ async def system_status() -> dict[str, Any]:
         "ollama": ai,
         "pending_jobs": pending_jobs,
     }
+
+
+@app.get("/api/settings")
+def settings() -> dict[str, str]:
+    with db() as conn:
+        values = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM app_settings")}
+    values.setdefault("ollama_model", OLLAMA_MODEL)
+    values.setdefault("ollama_embedding_model", OLLAMA_EMBEDDING_MODEL)
+    values.setdefault("qdrant_collection", QDRANT_COLLECTION)
+    return values
+
+
+@app.patch("/api/settings")
+def update_settings(payload: SettingsUpdate) -> dict[str, str]:
+    values = {key: str(value) for key, value in payload.model_dump().items() if value is not None}
+    with db() as conn:
+        for key, value in values.items():
+            conn.execute(
+                "INSERT INTO app_settings(key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                (key, value, now()),
+            )
+    audit("settings.updated", "settings", None, values)
+    return settings()
+
+
+@app.get("/api/audit")
+def audit_logs(limit: int = Query(default=100, ge=1, le=1000)) -> list[dict[str, Any]]:
+    with db() as conn:
+        return [row_dict(row) for row in conn.execute(
+            "SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT ?", (limit,)
+        )]
+
+
+@app.post("/api/backups")
+def create_backup() -> dict[str, Any]:
+    backup_dir = STORAGE / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    target = backup_dir / f"exam-ai-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.db"
+    with db() as source, sqlite3.connect(target) as destination:
+        source.backup(destination)
+    audit("backup.created", "database", None, {"path": str(target)})
+    return {"path": str(target), "size": target.stat().st_size}
 
 
 @app.get("/api/ai/status")
@@ -528,6 +583,30 @@ def extract_pdf(data: bytes) -> tuple[str, int]:
         return "", 0
 
 
+def extract_pdf_with_ocr(data: bytes) -> tuple[str, int, bool]:
+    text, pages = extract_pdf(data)
+    if text.strip():
+        return text, pages, False
+    executable = shutil.which("ocrmypdf")
+    if not executable:
+        return "", pages, False
+    source = STORAGE / f"ocr-{uuid.uuid4()}.pdf"
+    target = STORAGE / f"ocr-{uuid.uuid4()}-out.pdf"
+    try:
+        source.write_bytes(data)
+        subprocess.run(
+            [executable, "--skip-text", str(source), str(target)],
+            check=True, capture_output=True, timeout=300,
+        )
+        ocr_text, ocr_pages = extract_pdf(target.read_bytes())
+        return ocr_text, ocr_pages, True
+    except (OSError, subprocess.SubprocessError, RuntimeError, ValueError):
+        return "", pages, False
+    finally:
+        source.unlink(missing_ok=True)
+        target.unlink(missing_ok=True)
+
+
 @app.post("/api/documents/upload")
 async def upload_document(file: UploadFile = File(...)) -> dict[str, Any]:
     suffix = Path(file.filename or "").suffix.lower()
@@ -548,7 +627,10 @@ async def upload_document(file: UploadFile = File(...)) -> dict[str, Any]:
     document_id = str(uuid.uuid4())
     target = UPLOADS / f"{document_id}{suffix}"
     target.write_bytes(data)
-    text, pages = extract_pdf(data) if suffix == ".pdf" else (data.decode("utf-8", errors="replace"), 0)
+    if suffix == ".pdf":
+        text, pages, _ = extract_pdf_with_ocr(data)
+    else:
+        text, pages = data.decode("utf-8", errors="replace"), 0
     document_type = "PDF" if suffix == ".pdf" else "MARKDOWN"
     with db() as conn:
         conn.execute(

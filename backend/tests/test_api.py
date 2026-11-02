@@ -70,6 +70,9 @@ def test_upload_validation_and_progress():
         assert invalid.status_code == 415
         assert client.get("/api/analytics/progress").status_code == 200
         assert client.get("/api/analytics/errors").status_code == 200
+        assert client.get("/api/settings").status_code == 200
+        assert client.post("/api/backups").status_code == 200
+        assert client.get("/api/audit").status_code == 200
 
 
 def test_generated_question_keeps_source(monkeypatch):

@@ -7,3 +7,5 @@ node_modules/
 storage/*.db
 storage/uploads/*
 !storage/uploads/.gitkeep
+storage/backups/*
+!storage/backups/.gitkeep

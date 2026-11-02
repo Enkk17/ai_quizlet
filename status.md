@@ -43,6 +43,7 @@ Legenda:
 | PostgreSQL migration | Dipendenze SQLAlchemy/Alembic, configurazione `DATABASE_URL` e migrazione iniziale disponibili. |
 | Import quality | Deduplicazione domande ufficiali e report persistente degli input Markdown invalidi. |
 | AI provenance | Job di generazione, versione prompt, modello usato, audit log e riferimenti documentali per domande AI. |
+| Hardening operativo | Limiti upload, fallback OCR opzionale, configurazione runtime, audit consultabile e backup SQLite. |
 | Container applicativi | Dockerfile funzionanti per backend e frontend. |
 | Infrastruttura locale | PostgreSQL, Qdrant, backend e frontend definiti in Docker Compose. |
 | Persistenza Docker | Volumi configurati per dati applicativi, PostgreSQL e Qdrant. |
@@ -110,6 +111,13 @@ Legenda:
 - Backup/restore di PostgreSQL, file e Qdrant.
 - Autenticazione prima dell’esposizione sulla rete.
 - Paginazione delle API e gestione completa degli errori.
+
+## Avanzamento recente
+
+- Endpoint operativi `/api/settings`, `/api/audit` e `/api/backups`.
+- Backup SQLite locale con directory persistente esclusa dal versionamento.
+- Fallback OCR opzionale tramite `ocrmypdf` quando il binario è installato.
+- Test automatici aggiornati: 4 test superati; build frontend verificata.
 
 ### Testing
 
