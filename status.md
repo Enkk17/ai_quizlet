@@ -117,6 +117,7 @@ Legenda:
 - Endpoint operativi `/api/settings`, `/api/audit` e `/api/backups`.
 - Backup SQLite locale con directory persistente esclusa dal versionamento.
 - Fallback OCR opzionale tramite `ocrmypdf` quando il binario è installato.
+- Paginazione con `offset`/`limit` su documenti, domande, job, esami e chunk.
 - Test automatici aggiornati: 4 test superati; build frontend verificata.
 
 ### Testing

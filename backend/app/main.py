@@ -452,11 +452,14 @@ async def ai_test() -> dict[str, Any]:
 
 
 @app.get("/api/documents")
-def documents() -> list[dict[str, Any]]:
+def documents(
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> list[dict[str, Any]]:
     with db() as conn:
         return [row_dict(r) for r in conn.execute(
             "SELECT id, filename, document_type, file_size, status, total_pages, created_at "
-            "FROM documents ORDER BY created_at DESC"
+            "FROM documents ORDER BY created_at DESC LIMIT ? OFFSET ?", (limit, offset)
         )]
 
 
@@ -520,14 +523,19 @@ async def reindex_document(document_id: str, background_tasks: BackgroundTasks) 
 
 
 @app.get("/api/jobs")
-def jobs(status: str | None = None) -> list[dict[str, Any]]:
+def jobs(
+    status: str | None = None,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> list[dict[str, Any]]:
     with db() as conn:
         if status:
             return [row_dict(row) for row in conn.execute(
-                "SELECT * FROM processing_jobs WHERE status = ? ORDER BY created_at DESC", (status,)
+                "SELECT * FROM processing_jobs WHERE status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (status, limit, offset),
             )]
         return [row_dict(row) for row in conn.execute(
-            "SELECT * FROM processing_jobs ORDER BY created_at DESC"
+            "SELECT * FROM processing_jobs ORDER BY created_at DESC LIMIT ? OFFSET ?", (limit, offset)
         )]
 
 
@@ -541,13 +549,18 @@ def job_detail(job_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/documents/{document_id}/chunks")
-def document_chunks(document_id: str) -> list[dict[str, Any]]:
+def document_chunks(
+    document_id: str,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> list[dict[str, Any]]:
     with db() as conn:
         if not conn.execute("SELECT id FROM documents WHERE id = ?", (document_id,)).fetchone():
             raise HTTPException(404, "Documento non trovato")
         return [row_dict(row) for row in conn.execute(
             "SELECT id, document_id, content, page_start, page_end, chunk_index, content_hash, created_at "
-            "FROM document_chunks WHERE document_id = ? ORDER BY chunk_index", (document_id,)
+            "FROM document_chunks WHERE document_id = ? ORDER BY chunk_index LIMIT ? OFFSET ?",
+            (document_id, limit, offset),
         )]
 
 
@@ -713,14 +726,20 @@ def save_question(conn: sqlite3.Connection, document_id: str, chapter: str, item
 
 
 @app.get("/api/questions")
-def questions(source_type: str | None = None, topic: str | None = None) -> list[dict[str, Any]]:
+def questions(
+    source_type: str | None = None,
+    topic: str | None = None,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> list[dict[str, Any]]:
     query = "SELECT * FROM questions WHERE 1=1"
     args: list[str] = []
     if source_type and source_type != "MIXED":
         query += " AND source_type = ?"; args.append(source_type)
     if topic:
         query += " AND topic = ?"; args.append(topic)
-    query += " ORDER BY created_at DESC"
+    query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+    args.extend([str(limit), str(offset)])
     with db() as conn:
         return [question_public(r) for r in conn.execute(query, args)]
 
@@ -1006,12 +1025,15 @@ def results(exam_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/exams")
-def exams() -> list[dict[str, Any]]:
+def exams(
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> list[dict[str, Any]]:
     with db() as conn:
         return [row_dict(r) for r in conn.execute(
             "SELECT id, title, status, created_at, completed_at, "
             "(length(question_ids) - length(replace(question_ids, ',', '')) + 1) total_questions "
-            "FROM exams ORDER BY created_at DESC"
+            "FROM exams ORDER BY created_at DESC LIMIT ? OFFSET ?", (limit, offset)
         )]
 
 

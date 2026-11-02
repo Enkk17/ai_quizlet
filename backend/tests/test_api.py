@@ -73,6 +73,9 @@ def test_upload_validation_and_progress():
         assert client.get("/api/settings").status_code == 200
         assert client.post("/api/backups").status_code == 200
         assert client.get("/api/audit").status_code == 200
+        assert client.get("/api/documents?limit=1&offset=0").status_code == 200
+        assert client.get("/api/questions?limit=1&offset=0").status_code == 200
+        assert client.get("/api/jobs?limit=1&offset=0").status_code == 200
 
 
 def test_generated_question_keeps_source(monkeypatch):
