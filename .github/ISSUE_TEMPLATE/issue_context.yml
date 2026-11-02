@@ -1,0 +1,13 @@
+name: General issue
+description: Submit an issue with required context.
+title: "[Issue]: "
+labels: []
+body:
+  - type: input
+    id: context
+    attributes:
+      label: Context
+      description: Provide relevant context for this issue.
+      placeholder: https://github.com/settings/profile
+    validations:
+      required: true
