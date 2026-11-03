@@ -118,6 +118,8 @@ Legenda:
 - Backup SQLite locale con directory persistente esclusa dal versionamento.
 - Fallback OCR opzionale tramite `ocrmypdf` quando il binario è installato.
 - Paginazione con `offset`/`limit` su documenti, domande, job, esami e chunk.
+- Guida di installazione per primi test aggiornata con esempio Markdown e percorso SQLite senza servizi esterni.
+- Smoke test live completato: health, upload Markdown, creazione quiz, risposta corretta e risultato al 100%.
 - Test automatici aggiornati: 4 test superati; build frontend verificata.
 
 ### Testing
